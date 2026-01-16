@@ -1,0 +1,74 @@
+services:
+  text-encoder:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file: .env
+    volumes:
+      - ${HF_HOME:?HF_HOME must be set}:/hf_cache:ro
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-flux.2-klein-base-4b}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    entrypoint: ["uv", "run", "flux2-text-encoder"]
+
+  inference:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${HF_HOME:?HF_HOME must be set}:/hf_cache:ro
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-flux.2-klein-base-4b}
+      - TEXT_ENCODER_URL=http://text-encoder:8001
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      text-encoder:
+        condition: service_healthy
+
+  setup:
+    build: .
+    env_file: .env
+    volumes:
+      - ${HF_HOME:?HF_HOME must be set}:/hf_cache:rw
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-flux.2-klein-base-4b}
+      - STRICT_MODE=false
+    profiles:
+      - setup
+    entrypoint: ["uv", "run", "flux2-setup"]
+
+  startup:
+    build: .
+    env_file: .env
+    volumes:
+      - ${HF_HOME:?HF_HOME must be set}:/hf_cache:ro
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-flux.2-klein-base-4b}
+    profiles:
+      - check
+    entrypoint: ["uv", "run", "flux2-startup"]

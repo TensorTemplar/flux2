@@ -41,9 +41,12 @@ class Mistral3SmallEmbedder(nn.Module):
 
         self.model: Mistral3ForConditionalGeneration = Mistral3ForConditionalGeneration.from_pretrained(
             model_spec,
-            torch_dtype=getattr(torch, torch_dtype),
+            dtype=getattr(torch, torch_dtype),
+            local_files_only=True,
         )
-        self.processor = AutoProcessor.from_pretrained(model_spec_processor, use_fast=False)
+        self.processor = AutoProcessor.from_pretrained(
+            model_spec_processor, use_fast=False, local_files_only=True
+        )
         self.yes_token, self.no_token = self.processor.tokenizer.encode(
             ["yes", "no"], add_special_tokens=False
         )
@@ -373,11 +376,12 @@ class Qwen3Embedder(nn.Module):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_spec,
-            torch_dtype=None,
+            dtype=None,
             device_map=str(device),
+            local_files_only=True,
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_spec)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_spec, local_files_only=True)
         self.max_length = MAX_LENGTH
 
     @torch.no_grad()
