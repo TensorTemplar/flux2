@@ -48,8 +48,11 @@ class Klein4BParams:
     use_guidance_embed: bool = False
 
 
+ModelParams = Flux2Params | Klein9BParams | Klein4BParams
+
+
 class Flux2(nn.Module):
-    def __init__(self, params: Flux2Params):
+    def __init__(self, params: ModelParams):
         super().__init__()
 
         self.in_channels = params.in_channels

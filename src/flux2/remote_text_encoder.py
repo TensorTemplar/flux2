@@ -68,6 +68,35 @@ class RemoteTextEncoder:
         tensors = deserialize_tensors(response.content, device=device)
         return tensors["ctx"], tensors["ctx_ids"]
 
+    async def upsample(
+        self,
+        prompts: list[str],
+        temperature: float = 0.15,
+    ) -> list[str]:
+        """Upsample prompts via remote text encoder.
+
+        Args:
+            prompts: List of text prompts to upsample
+            temperature: Sampling temperature (default 0.15)
+
+        Returns:
+            List of upsampled prompts
+        """
+        client = await self._get_client()
+
+        response = await client.post(
+            "/upsample",
+            json={"prompts": prompts, "temperature": temperature},
+        )
+
+        if response.status_code == 501:
+            raise RemoteTextEncoderError("Upsampling not supported by remote encoder (Qwen models)")
+
+        if response.status_code != 200:
+            raise RemoteTextEncoderError(f"Upsample request failed: {response.status_code} {response.text}")
+
+        return response.json()["prompts"]
+
     async def health(self) -> dict:
         """Check service health."""
         client = await self._get_client()

@@ -12,6 +12,7 @@ import click
 import huggingface_hub
 
 from ..settings import HFHomeNotSetError, get_settings
+from ..text_encoder import MISTRAL_BF16_MODEL_SPEC, MISTRAL_FP8_MODEL_SPEC
 from ..util import (
     FLUX2_MODEL_INFO,
     check_ae_available,
@@ -21,14 +22,14 @@ from ..util import (
 )
 
 
-def download_flow_model(model_name: str) -> bool:
+def download_flow_model(model_name: str, max_workers: int = 4) -> bool:
     """Download flow model weights if missing."""
     if check_flow_model_available(model_name):
         print("  Flow model already cached")
         return True
 
     config = FLUX2_MODEL_INFO[model_name.lower()]
-    print(f"  Downloading flow model from {config['repo_id']}...")
+    print(f"  Downloading flow model from {config['repo_id']} ({config['filename']})...")
 
     try:
         huggingface_hub.hf_hub_download(
@@ -43,25 +44,35 @@ def download_flow_model(model_name: str) -> bool:
         return False
 
 
-def download_text_encoder(model_name: str) -> bool:
+def download_text_encoder(model_name: str, max_workers: int = 4, enable_moderation: bool = False) -> bool:
     """Download text encoder model if missing."""
     if check_text_encoder_available(model_name):
         print("  Text encoder already cached")
         return True
 
+    settings = get_settings()
+
     if "klein" in model_name.lower():
         variant = "4B" if "4b" in model_name.lower() else "8B"
         encoder_repo = f"Qwen/Qwen3-{variant}-FP8"
     else:
-        encoder_repo = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+        encoder_repo = MISTRAL_FP8_MODEL_SPEC if settings.text_encoder_fp8 else MISTRAL_BF16_MODEL_SPEC
 
-    print(f"  Downloading text encoder from {encoder_repo}...")
+    print(f"  Downloading text encoder from {encoder_repo} (workers={max_workers})...")
 
     try:
         huggingface_hub.snapshot_download(
             repo_id=encoder_repo,
             repo_type="model",
+            max_workers=max_workers,
         )
+        if enable_moderation:
+            print("  Downloading NSFW classifier (Falconsai/nsfw_image_detection)...")
+            huggingface_hub.snapshot_download(
+                repo_id="Falconsai/nsfw_image_detection",
+                repo_type="model",
+                max_workers=max_workers,
+            )
         print("  Text encoder downloaded successfully")
         return True
     except Exception as e:
@@ -75,13 +86,18 @@ def download_autoencoder(model_name: str) -> bool:
         print("  Autoencoder already cached")
         return True
 
-    config = FLUX2_MODEL_INFO[model_name.lower()]
-    print(f"  Downloading autoencoder from {config['repo_id']}...")
+    # NVFP4 doesn't have ae.safetensors, use FLUX.2-dev repo
+    if "nvfp4" in model_name.lower():
+        ae_repo = "black-forest-labs/FLUX.2-dev"
+    else:
+        ae_repo = FLUX2_MODEL_INFO[model_name.lower()]["repo_id"]
+
+    print(f"  Downloading autoencoder from {ae_repo}...")
 
     try:
         huggingface_hub.hf_hub_download(
-            repo_id=config["repo_id"],
-            filename=config["filename_ae"],
+            repo_id=ae_repo,
+            filename="ae.safetensors",
             repo_type="model",
         )
         print("  Autoencoder downloaded successfully")
@@ -91,19 +107,20 @@ def download_autoencoder(model_name: str) -> bool:
         return False
 
 
-def download_moderation_model() -> bool:
+def download_moderation_model(max_workers: int = 4) -> bool:
     """Download Mistral moderation/upsampling model if missing."""
     if check_moderation_model_available():
         print("  Moderation model already cached")
         return True
 
     encoder_repo = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
-    print(f"  Downloading moderation model from {encoder_repo}...")
+    print(f"  Downloading moderation model from {encoder_repo} (workers={max_workers})...")
 
     try:
         huggingface_hub.snapshot_download(
             repo_id=encoder_repo,
             repo_type="model",
+            max_workers=max_workers,
         )
         print("  Moderation model downloaded successfully")
         return True
@@ -146,9 +163,11 @@ def main(
 
     # Check HF_HOME
     hf_home = settings.get_hf_home()
+    max_workers = settings.hf_download_workers
     print(f"HF_HOME: {hf_home}")
     print(f"Model: {model_name}")
     print(f"Moderation: {'enabled' if enable_moderation else 'disabled'}")
+    print(f"Download workers: {max_workers}")
     print()
 
     success = True
@@ -157,11 +176,13 @@ def main(
     print("Checking and downloading models...")
 
     if not skip_flow:
-        if not download_flow_model(model_name):
+        if not download_flow_model(model_name, max_workers=max_workers):
             success = False
 
     if not skip_encoder:
-        if not download_text_encoder(model_name):
+        if not download_text_encoder(
+            model_name, max_workers=max_workers, enable_moderation=enable_moderation
+        ):
             success = False
 
     if not skip_ae:
@@ -169,7 +190,7 @@ def main(
             success = False
 
     if enable_moderation:
-        if not download_moderation_model():
+        if not download_moderation_model(max_workers=max_workers):
             success = False
 
     print()

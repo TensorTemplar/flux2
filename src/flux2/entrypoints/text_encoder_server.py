@@ -5,6 +5,7 @@ encoded embeddings via HTTP using safetensors serialization.
 """
 
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,15 @@ class EncodeRequest(BaseModel):
         default=False,
         description="Include empty string encoding for CFG (prepended to batch)",
     )
+
+
+class UpsampleRequest(BaseModel):
+    prompts: list[str] = Field(..., description="Text prompts to upsample")
+    temperature: float = Field(default=0.15, description="Sampling temperature")
+
+
+class UpsampleResponse(BaseModel):
+    prompts: list[str] = Field(..., description="Upsampled prompts")
 
 
 class HealthResponse(BaseModel):
@@ -125,6 +135,8 @@ def encode(req: EncodeRequest):
     - ctx: (B, seq_len, context_dim) bfloat16
     - ctx_ids: (B, seq_len, 4) int64
     """
+    t_start = time.perf_counter()
+
     if not _state.is_ready:
         return Response(status_code=503, content="Encoder not loaded")
 
@@ -142,10 +154,40 @@ def encode(req: EncodeRequest):
 
     data = serialize_tensors({"ctx": ctx.cpu(), "ctx_ids": ctx_ids.cpu()})
 
+    t_total = time.perf_counter() - t_start
+    print(f"[encode] prompts={len(prompts)} include_empty={req.include_empty} total={t_total:.2f}s")
+
     return Response(
         content=data,
         media_type="application/octet-stream",
     )
+
+
+@app.post("/upsample", response_model=UpsampleResponse)
+def upsample(req: UpsampleRequest):
+    """Upsample text prompts using the text encoder's language model.
+
+    Uses Mistral's generation capabilities to expand terse prompts into
+    detailed image descriptions suitable for FLUX.2.
+    """
+    t_start = time.perf_counter()
+
+    if not _state.is_ready:
+        return Response(status_code=503, content="Encoder not loaded")
+
+    if not hasattr(_state.text_encoder, "upsample_prompt"):
+        return Response(status_code=501, content="Upsampling not supported by this encoder")
+
+    with torch.no_grad():
+        upsampled = _state.text_encoder.upsample_prompt(
+            req.prompts,
+            temperature=req.temperature,
+        )
+
+    t_total = time.perf_counter() - t_start
+    print(f"[upsample] prompts={len(req.prompts)} total={t_total:.2f}s")
+
+    return UpsampleResponse(prompts=upsampled)
 
 
 @click.command()

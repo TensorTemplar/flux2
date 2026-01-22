@@ -50,6 +50,11 @@ This document describes the containerized deployment architecture for FLUX.2, de
 │  │                 │   │                 │   │                 │   │
 │  │  Klein: Qwen3   │   │  Klein: 4B/9B   │   │  ae.safetensors │   │
 │  │  (~8GB FP8)     │   │  Dev: 32B       │   │  (~250MB)       │   │
+│  │                 │   │  (~60GB bf16)   │   │                 │   │
+│  │  Dev: Mistral   │   │                 │   │                 │   │
+│  │  torchao_fp8:   │   │                 │   │                 │   │
+│  │   ~24GB         │   │                 │   │                 │   │
+│  │  bf16: ~48GB    │   │                 │   │                 │   │
 │  └─────────────────┘   └─────────────────┘   └─────────────────┘   │
 │           │                                                         │
 │           ▼                                                         │
@@ -87,9 +92,17 @@ The moderation model (Mistral-24B) is **lazy-loaded** to avoid unnecessary 50GB 
 | `ENABLE_MODERATION` | No | `false` | Load Mistral-24B for content moderation |
 | `STRICT_MODE` | No | `false` | Fail if models missing (no auto-download) |
 | `TEXT_ENCODER_URL` | No | None | URL of remote text encoder service (distributed mode) |
+| `TEXT_ENCODER_FP8` | No | `true` | Use FP8 quantized Mistral text encoder (legacy, use TEXT_ENCODER_QUANTIZATION) |
+| `TEXT_ENCODER_QUANTIZATION` | No | `torchao_fp8` | Quantization mode: `torchao_fp8` (native FP8 compute, ~24GB), `compressed_fp8` (storage-only, ~48GB peak), `none` |
+| `INFERENCE_URL` | No | None | URL for CLI remote inference (used by `--remote` flag) |
 | `OPENAI_API_KEY` | No | None | API key for prompt upsampling (SecretStr) |
 | `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
 | `OPENAI_MODEL` | No | `gpt-4o` | Model for prompt upsampling |
+| `TORCH_COMPILE` | No | `false` | Enable torch.compile() on flow model and autoencoder |
+| `TORCH_COMPILE_MODE` | No | `reduce-overhead` | Compile mode: `reduce-overhead` (CUDA graphs), `max-autotune` (Triton kernels) |
+| `ALLOW_TF32` | No | `true` | Enable TF32 for matmul/cudnn on Ampere+ GPUs |
+| `PROFILER_ENABLED` | No | `false` | Enable PyTorch profiler for inference tracing |
+| `PROFILER_OUTPUT_DIR` | No | `/profiler` | Directory for profiler Chrome trace output |
 
 ### Settings Discovery
 
@@ -389,9 +402,41 @@ src/flux2/
 ├── vae_loader.py             # VAE format detection and loading
 └── ...
 
-Dockerfile              # CUDA 12.9 + uv
+Dockerfile              # CUDA 13.0 + uv
 docker-compose.yml      # Local development/testing
-pyproject.toml          # Dependencies + PyTorch cu129 index
+pyproject.toml          # Dependencies + PyTorch cu130 index
+```
+
+## CLI Remote Mode
+
+The CLI supports remote inference without requiring local CUDA installation:
+
+```bash
+# Install minimal dependencies (no CUDA/PyTorch)
+uv sync
+
+# Generate via remote server
+uv run python scripts/cli.py --remote http://server:8000 --single-eval --prompt "a cat"
+
+# Or set INFERENCE_URL in environment for auto-detection
+export INFERENCE_URL=http://server:8000
+uv run python scripts/cli.py --single-eval --prompt "a cat"
+```
+
+### Dependency Extras
+
+| Extra | Contents | Use Case |
+|-------|----------|----------|
+| (core) | click, httpx, pydantic, Pillow | CLI remote mode |
+| `inference` | + torch, transformers, torchao, etc. | Local inference |
+| `server` | + FastAPI, uvicorn | Running the server |
+| `dev` | + ruff, pytest | Development |
+
+```bash
+uv sync                    # Remote CLI only
+uv sync --extra inference  # Local inference
+uv sync --extra server     # Run server
+uv sync --extra dev        # Development
 ```
 
 ## Troubleshooting
@@ -413,8 +458,76 @@ The BFL native `ae.safetensors` format is required. Diffusers VAE format is inco
 
 ### Out of Memory
 
+**Klein models (single GPU):**
 - Klein 4B: ~12GB VRAM
 - Klein 9B: ~20GB VRAM
 - With moderation: +24GB for Mistral-24B
 
+**FLUX.2 [dev] VRAM requirements:**
+
+| Configuration | Flow Model | Text Encoder | Total | Single GPU? |
+|---------------|------------|--------------|-------|-------------|
+| torchao_fp8 (recommended) | ~60GB | ~24GB | ~84GB | ✓ 96GB GPU |
+| compressed_fp8 | ~60GB | ~48GB peak | ~108GB | ✗ Distributed |
+| bf16 (no quant) | ~60GB | ~48GB | ~108GB | ✗ Distributed |
+
+**Single-GPU deployment (RTX Pro 6000 Blackwell 96GB):**
+```bash
+# Uses torchao Float8 dynamic quantization for native FP8 tensor core compute
+TEXT_ENCODER_QUANTIZATION=torchao_fp8 MODEL_NAME=flux.2-dev flux2-serve
+```
+Tested: ~93GB VRAM used, 3GB free after repeated inference.
+
+**Distributed deployment (2 GPUs):**
+- GPU 1 (e.g., RTX 6000 Pro 48GB+): Flow model (~60GB)
+- GPU 2 (e.g., A6000 48GB): Text encoder with torchao_fp8 (~24GB)
+
 Consider using `--enable-moderation=false` or OpenRouter for prompt upsampling.
+
+## Performance Optimization
+
+### torch.compile Modes
+
+| Mode | Backend | First Run | Steady State | Use Case |
+|------|---------|-----------|--------------|----------|
+| (disabled) | Eager | Instant | ~70s denoise | Development/debugging |
+| `reduce-overhead` | CUDA graphs | ~10s | ~55s denoise | Production default |
+| `max-autotune` | Triton + CUDA graphs | ~100s | ~50s denoise | Maximum throughput |
+
+**Recommendation**: Use `max-autotune` for production after warming up. The first inference triggers Triton kernel autotuning which benchmarks block sizes.
+
+### TF32 (TensorFloat-32)
+
+Enabled by default (`ALLOW_TF32=true`). Provides ~10-15% speedup on Ampere+ GPUs (RTX 30xx, A100, RTX 40xx, RTX 50xx) with minimal precision loss for image generation.
+
+### Profiling
+
+The PyTorch profiler captures operator-level traces for performance analysis:
+
+```bash
+# Deploy with profiling overlay
+kubectl kustomize k8s/flux2/overlays/dev-profiling | kubectl apply -f -
+
+# Run inference (traces saved to /profiler/trace_<seed>/trace.json)
+curl -X POST http://localhost:8000/generate -H "Content-Type: application/json" \
+  -d '{"prompt": "test", "seed": 12345}'
+
+# Copy trace from PVC and view in Chrome
+# Open chrome://tracing and load trace.json
+```
+
+Profiling overlay configuration:
+- Inherits from `dev` overlay
+- Sets `PROFILER_ENABLED=true`
+- Sets `TORCH_COMPILE_MODE=max-autotune`
+- Mounts `profiler-output-pvc` at `/profiler` (nfs-scratch storage class)
+
+### Performance Benchmarks (FLUX.2 [dev] @ 1360×768, 50 steps)
+
+| Configuration | Denoise Time | Notes |
+|---------------|--------------|-------|
+| Eager (no compile) | ~70s | Baseline |
+| reduce-overhead | ~55s | CUDA graphs only |
+| max-autotune + TF32 | ~50s | Triton kernels + TF32 |
+
+Measured on RTX Pro 6000 Blackwell (96GB VRAM).

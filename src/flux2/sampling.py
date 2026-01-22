@@ -21,31 +21,38 @@ def compress_time(t_ids: Tensor) -> Tensor:
     return t_ids_compressed
 
 
-def scatter_ids(x: Tensor, x_ids: Tensor) -> list[Tensor]:
+def scatter_ids(x: Tensor, x_ids: Tensor, out_hw: tuple[int, int]) -> list[Tensor]:
     """
-    using position ids to scatter tokens into place
+    using position ids to scatter tokens into place.
+
+    Args:
+        x: Token tensor of shape (batch, seq, channels)
+        x_ids: Position IDs tensor of shape (batch, seq, 4) with (t, h, w, l) coords
+        out_hw: Output (height, width) dimensions. Required to avoid GPU sync.
     """
+    h, w = out_hw
     x_list = []
-    t_coords = []
     for data, pos in zip(x, x_ids):
-        _, ch = data.shape  # noqa: F841
+        _, ch = data.shape
         t_ids = pos[:, 0].to(torch.int64)
         h_ids = pos[:, 1].to(torch.int64)
         w_ids = pos[:, 2].to(torch.int64)
 
-        t_ids_cmpr = compress_time(t_ids)
+        if (t_ids != 0).any():
+            raise ValueError(f"scatter_ids: unexpected non-zero t_ids, max={t_ids.max().item()}")
 
-        t = torch.max(t_ids_cmpr) + 1
-        h = torch.max(h_ids) + 1
-        w = torch.max(w_ids) + 1
+        flat_ids = h_ids * w + w_ids
 
-        flat_ids = t_ids_cmpr * w * h + h_ids * w + w_ids
+        if (flat_ids < 0).any() or (flat_ids >= h * w).any():
+            raise ValueError(
+                f"scatter_ids: flat_ids out of bounds [0, {h * w}), "
+                f"range=[{flat_ids.min().item()}, {flat_ids.max().item()}]"
+            )
 
-        out = torch.zeros((t * h * w, ch), device=data.device, dtype=data.dtype)
+        out = torch.zeros((h * w, ch), device=data.device, dtype=data.dtype)
         out.scatter_(0, flat_ids.unsqueeze(1).expand(-1, ch), data)
 
-        x_list.append(rearrange(out, "(t h w) c -> 1 c t h w", t=t, h=h, w=w))
-        t_coords.append(torch.unique(t_ids, sorted=True))
+        x_list.append(rearrange(out, "(h w) c -> 1 c 1 h w", h=h, w=w))
     return x_list
 
 
@@ -66,32 +73,27 @@ def encode_image_refs(ae, img_ctx: list[Image.Image]):
     if not isinstance(img_ctx_prep, list):
         img_ctx_prep = [img_ctx_prep]
 
-    # Encode each reference image
     encoded_refs = []
     for img in img_ctx_prep:
         encoded = ae.encode(img[None].cuda())[0]
         encoded_refs.append(encoded)
 
-    # Create time offsets for each reference
     t_off = [scale + scale * t for t in torch.arange(0, len(encoded_refs))]
     t_off = [t.view(-1) for t in t_off]
 
-    # Process with position IDs
     ref_tokens, ref_ids = listed_prc_img(encoded_refs, t_coord=t_off)
 
-    # Concatenate all references along sequence dimension
-    ref_tokens = torch.cat(ref_tokens, dim=0)  # (total_ref_tokens, C)
-    ref_ids = torch.cat(ref_ids, dim=0)  # (total_ref_tokens, 4)
+    ref_tokens = torch.cat(ref_tokens, dim=0)
+    ref_ids = torch.cat(ref_ids, dim=0)
 
-    # Add batch dimension
-    ref_tokens = ref_tokens.unsqueeze(0)  # (1, total_ref_tokens, C)
-    ref_ids = ref_ids.unsqueeze(0)  # (1, total_ref_tokens, 4)
+    ref_tokens = ref_tokens.unsqueeze(0)
+    ref_ids = ref_ids.unsqueeze(0)
 
     return ref_tokens.to(torch.bfloat16), ref_ids
 
 
 def prc_txt(x: Tensor, t_coord: Tensor | None = None) -> tuple[Tensor, Tensor]:
-    _l, _ = x.shape  # noqa: F841
+    _l, _ = x.shape
 
     coords = {
         "t": torch.arange(1) if t_coord is None else t_coord,
@@ -139,7 +141,7 @@ def listed_wrapper(fn):
 
 
 def prc_img(x: Tensor, t_coord: Tensor | None = None) -> tuple[Tensor, Tensor]:
-    _, h, w = x.shape  # noqa: F841
+    _, h, w = x.shape
     x_coords = {
         "t": torch.arange(1) if t_coord is None else t_coord,
         "h": torch.arange(h),
@@ -160,7 +162,7 @@ def center_crop_to_multiple_of_x(
     img: Image.Image | list[Image.Image], x: int
 ) -> Image.Image | list[Image.Image]:
     if isinstance(img, list):
-        return [center_crop_to_multiple_of_x(_img, x) for _img in img]  # type: ignore
+        return [center_crop_to_multiple_of_x(_img, x) for _img in img]  # type: ignore[return-value]  # list input returns list
 
     w, h = img.size
     new_w = (w // x) * x
@@ -184,7 +186,6 @@ def cap_pixels(img: Image.Image | list[Image.Image], k):
     if pixel_count <= k:
         return img
 
-    # Scaling factor to reduce total pixels below K
     scale = math.sqrt(k / pixel_count)
     new_w = int(w * scale)
     new_h = int(h * scale)
@@ -218,7 +219,7 @@ def default_images_prep(
     x: Image.Image | list[Image.Image],
 ) -> torch.Tensor | list[torch.Tensor]:
     if isinstance(x, list):
-        return [default_images_prep(e) for e in x]  # type: ignore
+        return [default_images_prep(e) for e in x]  # type: ignore[return-value]  # list input returns list
     x_tensor = torchvision.transforms.ToTensor()(x)
     return 2 * x_tensor - 1
 
@@ -227,12 +228,12 @@ def default_prep(
     img: Image.Image | list[Image.Image], limit_pixels: int | None, ensure_multiple: int = 16
 ) -> torch.Tensor | list[torch.Tensor]:
     img_rgb = to_rgb(img)
-    img_min = cap_min_pixels(img_rgb)  # type: ignore
+    img_min = cap_min_pixels(img_rgb)  # type: ignore[arg-type]  # to_rgb preserves list/single structure
     if limit_pixels is not None:
-        img_cap = cap_pixels(img_min, limit_pixels)  # type: ignore
+        img_cap = cap_pixels(img_min, limit_pixels)  # type: ignore[arg-type]  # cap_min_pixels preserves structure
     else:
         img_cap = img_min
-    img_crop = center_crop_to_multiple_of_x(img_cap, ensure_multiple)  # type: ignore
+    img_crop = center_crop_to_multiple_of_x(img_cap, ensure_multiple)  # type: ignore[arg-type]  # cap_pixels preserves structure
     img_tensor = default_images_prep(img_crop)
     return img_tensor
 
@@ -279,6 +280,7 @@ def denoise(
     # extra img tokens (sequence-wise)
     img_cond_seq: Tensor | None = None,
     img_cond_seq_ids: Tensor | None = None,
+    profiler=None,
 ):
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
     for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
@@ -286,9 +288,9 @@ def denoise(
         img_input = img
         img_input_ids = img_ids
         if img_cond_seq is not None:
-            assert (
-                img_cond_seq_ids is not None
-            ), "You need to provide either both or neither of the sequence conditioning"
+            assert img_cond_seq_ids is not None, (
+                "You need to provide either both or neither of the sequence conditioning"
+            )
             img_input = torch.cat((img_input, img_cond_seq), dim=1)
             img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
         pred = model(
@@ -303,6 +305,9 @@ def denoise(
             pred = pred[:, : img.shape[1]]
 
         img = img + (t_prev - t_curr) * pred
+
+        if profiler is not None:
+            profiler.step()
 
     return img
 
@@ -323,6 +328,7 @@ def denoise_cfg(
     guidance: float,
     img_cond_seq: Tensor | None = None,
     img_cond_seq_ids: Tensor | None = None,
+    profiler=None,
 ):
     img = torch.cat([img, img], dim=0)
     img_ids = torch.cat([img_ids, img_ids], dim=0)
@@ -359,32 +365,26 @@ def denoise_cfg(
 
         img = img + (t_prev - t_curr) * pred
 
+        if profiler is not None:
+            profiler.step()
+
     return img.chunk(2)[0]
 
 
 def concatenate_images(
     images: list[Image.Image],
 ) -> Image.Image:
-    """
-    Concatenate a list of PIL images horizontally with center alignment and white background.
-    """
-
-    # If only one image, return a copy of it
+    """Concatenate PIL images horizontally with center alignment and white background."""
     if len(images) == 1:
         return images[0].copy()
 
-    # Convert all images to RGB if not already
     images = [img.convert("RGB") if img.mode != "RGB" else img for img in images]
 
-    # Calculate dimensions for horizontal concatenation
     total_width = sum(img.width for img in images)
     max_height = max(img.height for img in images)
 
-    # Create new image with white background
-    background_color = (255, 255, 255)
-    new_img = Image.new("RGB", (total_width, max_height), background_color)
+    new_img = Image.new("RGB", (total_width, max_height), (255, 255, 255))
 
-    # Paste images with center alignment
     x_offset = 0
     for img in images:
         y_offset = (max_height - img.height) // 2

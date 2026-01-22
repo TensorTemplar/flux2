@@ -22,19 +22,16 @@ def _find_hf_model_path(repo_id: str, filename: str) -> Path | None:
     if not model_cache.exists():
         return None
 
-    # Find the latest snapshot
     snapshots_dir = model_cache / "snapshots"
     if not snapshots_dir.exists():
         return None
 
-    # Get the most recent snapshot (by modification time)
     snapshots = list(snapshots_dir.iterdir())
     if not snapshots:
         return None
 
     latest_snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
 
-    # Check for the file directly
     model_file = latest_snapshot / filename
     if model_file.exists():
         return model_file.resolve()
@@ -135,6 +132,11 @@ class Flux2Settings(BaseSettings):
         validation_alias="KLEIN_9B_BASE_MODEL_PATH",
         description="Path to FLUX.2-klein-base-9B model (auto-discovered from HF cache if not set)",
     )
+    flux2_nvfp4_model_path: Path | None = Field(
+        default=None,
+        validation_alias="FLUX2_NVFP4_MODEL_PATH",
+        description="Path to FLUX.2-dev-NVFP4 model (auto-discovered from HF cache if not set)",
+    )
     upsample_prompt_mode: Literal["none", "local", "api"] = Field(
         default="none",
         validation_alias="UPSAMPLE_PROMPT_MODE",
@@ -160,6 +162,76 @@ class Flux2Settings(BaseSettings):
         validation_alias="TEXT_ENCODER_URL",
         description="URL of remote text encoder service for distributed inference",
     )
+    inference_url: str | None = Field(
+        default=None,
+        validation_alias="INFERENCE_URL",
+        description="URL of remote inference service (for CLI --remote default)",
+    )
+    output_dir: Path = Field(
+        default=Path("output"),
+        validation_alias="OUTPUT_DIR",
+        description="Directory for saving generated images",
+    )
+    hf_token: SecretStr | None = Field(
+        default=None,
+        validation_alias="HF_TOKEN",
+        description="HuggingFace API token for model downloads",
+    )
+    hf_hub_offline: bool = Field(
+        default=False,
+        validation_alias="HF_HUB_OFFLINE",
+        description="Run in offline mode - no network requests to HuggingFace Hub",
+    )
+    text_encoder_fp8: bool = Field(
+        default=True,
+        validation_alias="TEXT_ENCODER_FP8",
+        description="Use FP8 quantized Mistral text encoder for flux.2-dev (reduces VRAM ~50%)",
+    )
+    torch_compile: bool = Field(
+        default=False,
+        validation_alias="TORCH_COMPILE",
+        description="Use torch.compile() on flow model and autoencoder for faster inference",
+    )
+    torch_compile_mode: Literal["reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = Field(
+        default="reduce-overhead",
+        validation_alias="TORCH_COMPILE_MODE",
+        description="torch.compile mode: reduce-overhead (CUDA graphs), max-autotune (Triton+CUDA graphs), max-autotune-no-cudagraphs",
+    )
+    torch_compile_ae: bool = Field(
+        default=False,
+        validation_alias="TORCH_COMPILE_AE",
+        description="Also compile autoencoder (can hurt decode performance with max-autotune)",
+    )
+    torch_logs: str = Field(
+        default="",
+        validation_alias="TORCH_LOGS",
+        description="TORCH_LOGS categories: perf_hints, graph_breaks, recompiles (comma-separated)",
+    )
+    profiler_enabled: bool = Field(
+        default=False,
+        validation_alias="PROFILER_ENABLED",
+        description="Enable PyTorch profiler for inference tracing",
+    )
+    profiler_output_dir: Path = Field(
+        default=Path("/profiler"),
+        validation_alias="PROFILER_OUTPUT_DIR",
+        description="Directory for profiler trace output",
+    )
+    allow_tf32: bool = Field(
+        default=True,
+        validation_alias="ALLOW_TF32",
+        description="Allow TF32 for matmul/cudnn ops (faster on Ampere+ GPUs with minimal precision loss)",
+    )
+    text_encoder_quantization: Literal["torchao_fp8", "compressed_fp8", "none"] = Field(
+        default="torchao_fp8",
+        validation_alias="TEXT_ENCODER_QUANTIZATION",
+        description="Text encoder quantization: torchao_fp8 (native FP8 compute), compressed_fp8 (storage-only), none",
+    )
+    hf_download_workers: int = Field(
+        default=4,
+        validation_alias="HF_DOWNLOAD_WORKERS",
+        description="Number of parallel workers for HuggingFace downloads (default 4)",
+    )
 
     @model_validator(mode="after")
     def validate_strict_mode(self) -> "Flux2Settings":
@@ -180,7 +252,6 @@ class Flux2Settings(BaseSettings):
     @model_validator(mode="after")
     def discover_hf_paths(self) -> "Flux2Settings":
         """Auto-discover model paths from HuggingFace cache if not explicitly set."""
-        # Model repo mappings
         model_mappings = {
             "klein_4b_model_path": ("black-forest-labs/FLUX.2-klein-4B", "flux-2-klein-4b.safetensors"),
             "klein_4b_base_model_path": (
@@ -193,6 +264,7 @@ class Flux2Settings(BaseSettings):
                 "flux-2-klein-base-9b.safetensors",
             ),
             "flux2_model_path": ("black-forest-labs/FLUX.2-dev", "flux2-dev.safetensors"),
+            "flux2_nvfp4_model_path": ("black-forest-labs/FLUX.2-dev-NVFP4", "flux2-dev-nvfp4.safetensors"),
         }
 
         for attr, (repo_id, filename) in model_mappings.items():
@@ -230,6 +302,8 @@ class Flux2Settings(BaseSettings):
                 return self.klein_9b_base_model_path
             case "flux.2-dev":
                 return self.flux2_model_path
+            case "flux.2-dev-nvfp4":
+                return self.flux2_nvfp4_model_path
             case _:
                 raise ValueError(f"Unknown model: {model_name}")
 

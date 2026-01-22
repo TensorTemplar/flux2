@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -9,8 +10,11 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     Mistral3ForConditionalGeneration,
+    TorchAoConfig,
     pipeline,
 )
+
+from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
 
 from .sampling import cap_pixels, concatenate_images
 from .system_messages import (
@@ -30,23 +34,58 @@ NSFW_THRESHOLD = 0.85
 UPSAMPLING_MAX_IMAGE_SIZE = 768**2
 
 
+# Combined FP8 model with tokenizer (single repo for simplified deployment)
+MISTRAL_FP8_MODEL_SPEC = "TensorTemplar/flux2-text-encoder-fp8"
+MISTRAL_BF16_MODEL_SPEC = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+
+
 class Mistral3SmallEmbedder(nn.Module):
     def __init__(
         self,
-        model_spec: str = "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
-        model_spec_processor: str = "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        model_spec: str = MISTRAL_BF16_MODEL_SPEC,
         torch_dtype: str = "bfloat16",
+        use_fp8: bool = False,
+        quantization: Literal["torchao_fp8", "compressed_fp8", "none"] = "none",
+        enable_moderation: bool = False,
     ):
         super().__init__()
 
-        self.model: Mistral3ForConditionalGeneration = Mistral3ForConditionalGeneration.from_pretrained(
-            model_spec,
-            dtype=getattr(torch, torch_dtype),
-            local_files_only=True,
-        )
-        self.processor = AutoProcessor.from_pretrained(
-            model_spec_processor, use_fast=False, local_files_only=True
-        )
+        # Handle legacy use_fp8 parameter - map to quantization
+        if use_fp8 and quantization == "none":
+            quantization = "compressed_fp8"
+
+        # Use FP8 model spec for compressed_fp8 quantization
+        if quantization == "compressed_fp8":
+            model_spec = MISTRAL_FP8_MODEL_SPEC
+
+        if quantization == "torchao_fp8":
+            # True FP8 compute using torchao - native tensor core ops, no dequantization
+            quant_config = Float8DynamicActivationFloat8WeightConfig()
+            torchao_config = TorchAoConfig(quant_type=quant_config)
+            self.model: Mistral3ForConditionalGeneration = Mistral3ForConditionalGeneration.from_pretrained(
+                model_spec,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                quantization_config=torchao_config,
+                local_files_only=True,
+            )
+        elif quantization == "compressed_fp8":
+            # FP8 storage with bf16 compute (dequantizes on forward pass)
+            self.model: Mistral3ForConditionalGeneration = Mistral3ForConditionalGeneration.from_pretrained(
+                model_spec,
+                local_files_only=True,
+            )
+        else:
+            # No quantization - standard bf16
+            self.model: Mistral3ForConditionalGeneration = Mistral3ForConditionalGeneration.from_pretrained(
+                model_spec,
+                torch_dtype=getattr(torch, torch_dtype),
+                local_files_only=True,
+            )
+
+        # For torchao_fp8, processor comes from bf16 model spec (weights are quantized on-the-fly)
+        processor_spec = model_spec if quantization != "torchao_fp8" else MISTRAL_BF16_MODEL_SPEC
+        self.processor = AutoProcessor.from_pretrained(processor_spec, use_fast=False, local_files_only=True)
         self.yes_token, self.no_token = self.processor.tokenizer.encode(
             ["yes", "no"], add_special_tokens=False
         )
@@ -54,24 +93,21 @@ class Mistral3SmallEmbedder(nn.Module):
         self.max_length = MAX_LENGTH
         self.upsampling_max_image_size = UPSAMPLING_MAX_IMAGE_SIZE
 
-        self.nsfw_classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
+        self.enable_moderation = enable_moderation
+        self.nsfw_classifier = None
+        if enable_moderation:
+            self.nsfw_classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
 
     def _validate_and_process_images(
         self, img: list[list[Image.Image]] | list[Image.Image]
     ) -> list[list[Image.Image]]:
-        # Simple validation: ensure it's a list of PIL images or list of lists of PIL images
         if not img:
             return []
 
-        # Check if it's a list of lists or a list of images
         if isinstance(img[0], Image.Image):
-            # It's a list of images, convert to list of lists
             img = [[im] for im in img]
 
-        # potentially concatenate multiple images to reduce the size
         img = [[concatenate_images(img_i)] if len(img_i) > 1 else img_i for img_i in img]
-
-        # cap the pixels
         img = [[cap_pixels(img_i, self.upsampling_max_image_size) for img_i in img_i] for img_i in img]
         return img
 
@@ -124,7 +160,6 @@ class Mistral3SmallEmbedder(nn.Module):
             ]
 
             for i, (el, images) in enumerate(zip(messages, img)):
-                # optionally add the images per batch element.
                 if images is not None:
                     el.append(
                         {
@@ -132,7 +167,6 @@ class Mistral3SmallEmbedder(nn.Module):
                             "content": [{"type": "image", "image": image_obj} for image_obj in images],
                         }
                     )
-                # add the text.
                 el.append(
                     {
                         "role": "user",
@@ -204,8 +238,6 @@ class Mistral3SmallEmbedder(nn.Module):
                 use_cache=True,
             )
 
-            # Decode only the newly generated tokens (skip input tokens)
-            # Extract only the generated portion
             input_length = inputs["input_ids"].shape[1]
             generated_tokens = generated_ids[:, input_length:]
 
@@ -265,6 +297,9 @@ class Mistral3SmallEmbedder(nn.Module):
         return scores
 
     def test_image(self, image: Image.Image | str | Path | torch.Tensor) -> bool:
+        if not self.enable_moderation:
+            return False  # Not NSFW when moderation disabled
+
         if isinstance(image, torch.Tensor):
             image = rearrange(image[0].clamp(-1.0, 1.0), "c h w -> h w c")
             image = Image.fromarray((127.5 * (image + 1.0)).cpu().byte().numpy())
@@ -328,6 +363,9 @@ class Mistral3SmallEmbedder(nn.Module):
         return generate_ids[0, -1].item() == self.yes_token
 
     def test_txt(self, txt: str) -> bool:
+        if not self.enable_moderation:
+            return False  # Not flagged when moderation disabled
+
         chat = [
             {
                 "role": "system",
@@ -376,7 +414,7 @@ class Qwen3Embedder(nn.Module):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_spec,
-            dtype=None,
+            torch_dtype="auto",
             device_map=str(device),
             local_files_only=True,
         )
@@ -432,8 +470,21 @@ class Qwen3Embedder(nn.Module):
         raise NotImplementedError("Qwen3Embedder does not support upsampling")
 
 
-def load_mistral_small_embedder(device: str | torch.device = "cuda") -> Mistral3SmallEmbedder:
-    return Mistral3SmallEmbedder().to(device)
+def load_mistral_small_embedder(
+    device: str | torch.device = "cuda",
+    use_fp8: bool = False,
+    quantization: Literal["torchao_fp8", "compressed_fp8", "none"] = "none",
+    enable_moderation: bool = False,
+) -> Mistral3SmallEmbedder:
+    embedder = Mistral3SmallEmbedder(
+        use_fp8=use_fp8,
+        quantization=quantization,
+        enable_moderation=enable_moderation,
+    )
+    # For torchao_fp8, model is already on device via device_map="auto"
+    if quantization != "torchao_fp8":
+        embedder = embedder.to(device)
+    return embedder
 
 
 def load_qwen3_embedder(variant: str, device: str | torch.device = "cuda"):

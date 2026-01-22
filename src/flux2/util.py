@@ -14,6 +14,8 @@ from .autoencoder import AutoEncoder, AutoEncoderParams
 from .model import Flux2, Flux2Params, Klein4BParams, Klein9BParams
 from .settings import get_settings
 from .text_encoder import (
+    MISTRAL_BF16_MODEL_SPEC,
+    MISTRAL_FP8_MODEL_SPEC,
     Mistral3SmallEmbedder,
     Qwen3Embedder,
     load_mistral_small_embedder,
@@ -90,6 +92,17 @@ FLUX2_MODEL_INFO: dict[str, ModelInfo] = {
         "fixed_params": set(),
         "guidance_distilled": True,
     },
+    "flux.2-dev-nvfp4": {
+        "repo_id": "black-forest-labs/FLUX.2-dev-NVFP4",
+        "filename": "flux2-dev-nvfp4.safetensors",
+        "filename_ae": "ae.safetensors",  # Uses ae from FLUX.2-dev
+        "params": Flux2Params(),
+        "text_encoder_load_fn": load_mistral_small_embedder,
+        "model_path": "FLUX2_NVFP4_MODEL_PATH",
+        "defaults": {"guidance": 4.0, "num_steps": 50},
+        "fixed_params": set(),
+        "guidance_distilled": True,
+    },
 }
 
 
@@ -106,16 +119,16 @@ def check_flow_model_available(model_name: str) -> bool:
 def check_text_encoder_available(model_name: str) -> bool:
     """Check if text encoder model is available in HF cache.
 
-    For klein models, checks Qwen3. For flux.2-dev, checks Mistral.
+    For klein models, checks Qwen3. For flux.2-dev, checks Mistral (FP8 or bf16 based on settings).
     """
-    # Validate model name exists
     _ = FLUX2_MODEL_INFO[model_name.lower()]
+    settings = get_settings()
 
     if "klein" in model_name.lower():
         variant = "4B" if "4b" in model_name.lower() else "8B"
         encoder_repo = f"Qwen/Qwen3-{variant}-FP8"
     else:
-        encoder_repo = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+        encoder_repo = MISTRAL_FP8_MODEL_SPEC if settings.text_encoder_fp8 else MISTRAL_BF16_MODEL_SPEC
 
     try:
         huggingface_hub.snapshot_download(
@@ -154,16 +167,15 @@ def check_moderation_model_available() -> bool:
 def load_flow_model(model_name: str, debug_mode: bool = False, device: str | torch.device = "cuda") -> Flux2:
     config = FLUX2_MODEL_INFO[model_name.lower()]
     settings = get_settings()
+    weight_path: str | Path | None = None
 
     if debug_mode:
         config["params"].depth = 1
         config["params"].depth_single_blocks = 1
     else:
-        # Try to get path from settings (auto-discovered or env var)
         weight_path = settings.get_model_path(model_name)
 
         if weight_path is None:
-            # Fallback to HuggingFace download
             try:
                 weight_path = huggingface_hub.hf_hub_download(
                     repo_id=config["repo_id"],
@@ -182,10 +194,11 @@ def load_flow_model(model_name: str, debug_mode: bool = False, device: str | tor
             print(f"Using model path from settings: {weight_path}")
 
     if not debug_mode:
+        assert weight_path is not None, "weight_path must be set in non-debug mode"
         with torch.device("meta"):
             model = Flux2(FLUX2_MODEL_INFO[model_name.lower()]["params"]).to(torch.bfloat16)
         print(f"Loading {weight_path} for the FLUX.2 weights")
-        sd = load_sft(weight_path, device=str(device))
+        sd = load_sft(str(weight_path), device=str(device))
         model.load_state_dict(sd, strict=True, assign=True)
         return model.to(device)
     else:
@@ -195,6 +208,17 @@ def load_flow_model(model_name: str, debug_mode: bool = False, device: str | tor
 
 def load_text_encoder(model_name: str, device: str | torch.device = "cuda"):
     config = FLUX2_MODEL_INFO[model_name.lower()]
+    settings = get_settings()
+
+    # flux.2-dev and flux.2-dev-nvfp4 use Mistral which supports FP8 quantization
+    if model_name.lower() in ("flux.2-dev", "flux.2-dev-nvfp4"):
+        return load_mistral_small_embedder(
+            device=device,
+            use_fp8=settings.text_encoder_fp8,
+            quantization=settings.text_encoder_quantization,
+            enable_moderation=settings.enable_moderation,
+        )
+
     return config["text_encoder_load_fn"](device=device)
 
 
